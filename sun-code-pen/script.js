@@ -1,0 +1,456 @@
+console.log("Script module started... attempting to load modules.");
+
+// --- Helper function to show errors ---
+const showError = (error, context) => {
+    console.error(`A critical error occurred ${context}:`, error);
+     try {
+        if (typeof animationFrameId !== 'undefined' && animationFrameId) {
+             window.cancelAnimationFrame(animationFrameId);
+        }
+     } catch (e) {
+         console.error("Error cancelling animation frame:", e);
+     }
+    document.body.innerHTML = `<div class="error-display">A critical error occurred ${context}:\n\n${error?.stack ?? error ?? 'Unknown error'}</div>`;
+};
+
+let animationFrameId;
+
+// --- Loading core modules ---
+Promise.all([
+    import('https://esm.sh/three@0.165.0'),
+    import('https://esm.sh/gsap@3.12.5')
+]).then(([THREE, gsapModule]) => {
+
+    console.log("All modules imported successfully. Three.js version:", THREE.REVISION);
+
+    const { gsap } = gsapModule;
+
+    console.log("init() logic starting...");
+
+    // --- GLSL SHADER CODE ---
+    const vertexShader = `
+        uniform float u_time;
+        uniform float u_intensity;
+        varying vec2 vUv;
+        varying vec3 vNormal;
+        varying float vNoise;
+
+        float fbm_noise(vec3 p, float time) {
+            float total = 0.0;
+            float amplitude = 0.5;
+            float frequency = 2.0;
+            for (int i = 0; i < 4; i++) {
+                total += amplitude * sin(dot(p * frequency, vec3(1.2, 0.8, 0.5)) + time * 0.5);
+                total += amplitude * sin(dot(p * frequency, vec3(-0.7, 0.6, 1.5)) + time * 0.3);
+                frequency *= 2.0;
+                amplitude *= 0.5;
+            }
+            return total;
+        }
+
+        void main() {
+            vUv = uv;
+            vNormal = normalize(normalMatrix * normal);
+            vec3 displacedPosition = position;
+            float noise = fbm_noise(normalize(position), u_time * 0.5);
+            vNoise = noise;
+            displacedPosition += normal * noise * 0.05 * u_intensity; // Reduced from 0.1 to 0.05
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(displacedPosition, 1.0);
+        }
+    `;
+
+    const fragmentShader = `
+        varying vec2 vUv;
+        varying vec3 vNormal;
+        varying float vNoise;
+        uniform float u_time;
+        uniform float u_pulse;
+        uniform vec3 u_baseColor;
+        uniform vec3 u_glowColor;
+
+        void main() {
+            vec3 normal = normalize(vNormal);
+            float finalNoise = vNoise * (1.0 + u_pulse * 0.5);
+            vec3 colorA = u_baseColor;
+            vec3 colorB = vec3(1.0, 0.7, 0.0);
+            vec3 colorC = vec3(1.0, 0.9, 0.5);
+            vec3 surfaceColor = mix(colorA, colorB, smoothstep(-0.5, 0.3, finalNoise));
+            surfaceColor = mix(surfaceColor, colorC, smoothstep(0.1, 0.4, finalNoise));
+            float fresnel = 1.0 - dot(normal, vec3(0.0, 0.0, 1.0));
+            fresnel = pow(fresnel, 3.0 + u_pulse * 2.0);
+            vec3 corona = u_glowColor * fresnel * (1.5 + u_pulse * 0.5);
+            vec3 finalColor = surfaceColor + corona;
+            finalColor += mix(vec3(0.0), u_glowColor, smoothstep(0.3, 0.6, finalNoise));
+            gl_FragColor = vec4(finalColor, 1.0);
+        }
+    `;
+
+    // --- Global Variables ---
+    const canvas = document.getElementById('scene-container');
+    let width = canvas.clientWidth;
+    let height = canvas.clientHeight;
+    const mouse = new THREE.Vector2(0, 0);
+    const target = new THREE.Vector2(0, 0);
+
+    // --- Scene Setup ---
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+    camera.position.z = 5;
+
+    const renderer = new THREE.WebGLRenderer({
+        antialias: true,
+        canvas: canvas,
+    });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0xffffff, 1);
+    renderer.sortObjects = true;
+    console.log("...Scene, Camera, Renderer created.");
+
+    // --- Lights ---
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+    scene.add(ambientLight);
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(0, 0, 5);
+    scene.add(directionalLight);
+
+    // --- Groups ---
+    const sunBodyGroup = new THREE.Group();
+    scene.add(sunBodyGroup);
+
+    const faceGroup = new THREE.Group();
+    faceGroup.position.z = 1.78;
+    faceGroup.renderOrder = 999;
+    sunBodyGroup.add(faceGroup);
+
+    const orbitGroup = new THREE.Group();
+    scene.add(orbitGroup);
+    console.log("...Lights and Groups created.");
+
+    // --- Sun Mesh ---
+    const sunGeometry = new THREE.SphereGeometry(2, 128, 128);
+    const shaderMaterial = new THREE.ShaderMaterial({
+        vertexShader,
+        fragmentShader,
+        uniforms: {
+            u_time: { value: 0 },
+            u_pulse: { value: 0 },
+            u_intensity: { value: 1.0 },
+            u_baseColor: { value: new THREE.Color(0xff4500) },
+            u_glowColor: { value: new THREE.Color(0xffa500) },
+        },
+    });
+    const sunMesh = new THREE.Mesh(sunGeometry, shaderMaterial);
+    sunMesh.renderOrder = 1;
+    sunBodyGroup.add(sunMesh);
+
+    // --- Halo ---
+    const haloGeometry = new THREE.SphereGeometry(2.1, 32, 32);
+    const haloMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffa500, transparent: true, opacity: 0.2,
+        blending: THREE.AdditiveBlending, side: THREE.BackSide,
+        depthWrite: false
+    });
+    const haloMesh = new THREE.Mesh(haloGeometry, haloMaterial);
+    haloMesh.renderOrder = 2;
+    sunBodyGroup.add(haloMesh);
+    console.log("...Sun Mesh, Shader, and Halo created.");
+
+    // --- Flares ---
+    const flareGroup = new THREE.Group();
+    sunBodyGroup.add(flareGroup);
+    const flareCanvas = document.createElement('canvas');
+    flareCanvas.width = 64; flareCanvas.height = 64;
+    const flareCtx = flareCanvas.getContext('2d');
+    const gradient = flareCtx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gradient.addColorStop(0, 'rgba(255, 255, 200, 1)');
+    gradient.addColorStop(0.5, 'rgba(255, 180, 0, 0.5)');
+    gradient.addColorStop(1, 'rgba(255, 100, 0, 0)');
+    flareCtx.fillStyle = gradient; flareCtx.fillRect(0, 0, 64, 64);
+    const flareTexture = new THREE.CanvasTexture(flareCanvas);
+    const flareMaterial = new THREE.SpriteMaterial({
+        map: flareTexture, blending: THREE.AdditiveBlending,
+        depthWrite: false, transparent: true,
+    });
+    flareMaterial.renderOrder = 3;
+    for (let i = 0; i < 15; i++) {
+        const flare = new THREE.Sprite(flareMaterial);
+        const angle = Math.random() * Math.PI * 2;
+        const radius = 1.8 + Math.random() * 0.5;
+        flare.position.set( Math.cos(angle) * radius, Math.sin(angle) * radius, (Math.random() - 0.5) * 2 );
+        flare.scale.setScalar(0.5 + Math.random() * 0.5);
+        flare.userData.speed = 0.005 + Math.random() * 0.01;
+        flareGroup.add(flare);
+    }
+    console.log("...Flares created.");
+
+    // --- Asteroids ---
+    const asteroidGeometry = new THREE.IcosahedronGeometry(0.08, 0); // Slightly bigger
+    const asteroidMaterials = [
+        new THREE.MeshPhongMaterial({ color: 0x8B4513, flatShading: true, shininess: 10 }), // Brown
+        new THREE.MeshPhongMaterial({ color: 0x696969, flatShading: true, shininess: 10 }), // Dark gray
+        new THREE.MeshPhongMaterial({ color: 0x2F4F4F, flatShading: true, shininess: 10 }), // Dark slate gray
+        new THREE.MeshPhongMaterial({ color: 0x8B0000, flatShading: true, shininess: 10 })  // Dark red
+    ];
+    const numAsteroids = 25; // Fewer but more distinct
+    const orbitRadius = 8;
+    const asteroids = []; // Store asteroids for collision detection
+    
+    for (let i = 0; i < numAsteroids; i++) {
+        const particle = new THREE.Mesh(asteroidGeometry, asteroidMaterials[Math.floor(Math.random() * asteroidMaterials.length)]);
+        const angle = Math.random() * Math.PI * 2;
+        const radius = orbitRadius + (Math.random() - 0.5) * 4;
+        const yPos = (Math.random() - 0.5) * 3;
+        particle.position.set(Math.cos(angle) * radius, yPos, Math.sin(angle) * radius);
+        particle.userData.orbitId = Math.random() * 100;
+        particle.userData.orbitSpeed = 0.005 + Math.random() * 0.005;
+        particle.userData.rotationAxis = new THREE.Vector3(Math.random(), Math.random(), Math.random()).normalize();
+        particle.userData.rotationSpeed = Math.random() * 0.02;
+        asteroids.push(particle);
+        orbitGroup.add(particle);
+    }
+    console.log("...Asteroids created.");
+
+    // --- Eyes ---
+    const eyeballGeometry = new THREE.SphereGeometry(0.3, 32, 32);
+    const eyeballMaterial = new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 80, emissive: 0x050505 });
+    const pupilGeometry = new THREE.SphereGeometry(0.1, 32, 32);
+    const pupilMaterial = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        depthTest: false,
+        depthWrite: false,
+        transparent: true,
+        opacity: 1.0
+    });
+
+    // Left Eye Setup (No Eyelids)
+    const eyeLeft = new THREE.Group();
+    const eyeballLeft = new THREE.Mesh(eyeballGeometry, eyeballMaterial);
+    const pupilLeft = new THREE.Mesh(pupilGeometry, pupilMaterial);
+    pupilLeft.position.z = 0.301; // Pupil just in front of eyeball
+    pupilLeft.renderOrder = 1; // Pupil on top of eyeball
+    eyeballLeft.renderOrder = 0;
+    eyeLeft.add(eyeballLeft, pupilLeft);
+    eyeLeft.position.x = -0.7;
+    faceGroup.add(eyeLeft);
+
+    // Right Eye Setup (No Eyelids)
+    const eyeRight = new THREE.Group();
+    const eyeballRight = new THREE.Mesh(eyeballGeometry, eyeballMaterial);
+    const pupilRight = new THREE.Mesh(pupilGeometry, pupilMaterial);
+    pupilRight.position.z = 0.301;
+    pupilRight.renderOrder = 1;
+    eyeballRight.renderOrder = 0;
+    eyeRight.add(eyeballRight, pupilRight);
+    eyeRight.position.x = 0.7;
+    faceGroup.add(eyeRight);
+
+    // --- Eyebrows (New Better Version) ---
+    // Eyebrow Geometry - curved to match eye shape
+    const eyebrowGeometry = new THREE.SphereGeometry(0.3, 16, 8, 0, Math.PI * 2, 0, Math.PI * 0.25);
+    const eyebrowMaterial = new THREE.MeshPhongMaterial({
+        color: 0xff4500, // Same as sun base color
+        shininess: 80,
+        emissive: 0x050505,
+        side: THREE.FrontSide
+    });
+
+    // Left Eyebrow - positioned above eye
+    const eyebrowLeft = new THREE.Mesh(eyebrowGeometry, eyebrowMaterial);
+    eyebrowLeft.position.set(-0.7, 0.15, 0.32); // Positioned above eye
+    eyebrowLeft.renderOrder = 3; // Above everything
+    faceGroup.add(eyebrowLeft);
+
+    // Right Eyebrow - positioned above eye
+    const eyebrowRight = new THREE.Mesh(eyebrowGeometry, eyebrowMaterial);
+    eyebrowRight.position.set(0.7, 0.15, 0.32); // Positioned above eye
+    eyebrowRight.renderOrder = 3; // Above everything
+    faceGroup.add(eyebrowRight);
+
+    console.log("...Eyes and eyelids created.");
+
+    // --- Mouth ---
+    const mouthShape = new THREE.Shape();
+    mouthShape.moveTo(-0.5, -0.1);
+    mouthShape.bezierCurveTo(-0.25, -0.3, 0.25, -0.3, 0.5, -0.1);
+    mouthShape.bezierCurveTo(0.25, -0.25, -0.25, -0.25, -0.5, -0.1);
+    const mouthGeometry = new THREE.ShapeGeometry(mouthShape);
+    const mouthMaterial = new THREE.MeshPhongMaterial({
+        color: 0x8b0000, shininess: 50, side: THREE.DoubleSide
+     });
+    const mouthMesh = new THREE.Mesh(mouthGeometry, mouthMaterial);
+    mouthMesh.position.set(0, -0.6, 0.35); // Moved to front like before
+    mouthMesh.scale.set(1.0, 1.0, 1.0);
+    mouthMesh.renderOrder = 1; // Above other elements
+    faceGroup.add(mouthMesh);
+    console.log("...Face created.");
+
+    // --- Event Listeners ---
+    const handleMouseMove = (event) => {
+        mouse.x = (event.clientX / width) * 2 - 1;
+        mouse.y = -(event.clientY / height) * 2 + 1;
+    };
+    const handleResize = () => {
+        width = canvas.clientWidth;
+        height = canvas.clientHeight;
+        if (height === 0) return;
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+        renderer.setSize(width, height);
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('resize', handleResize);
+    // Add click to trigger blink for testing
+    window.addEventListener('click', () => {
+        console.log("Manual blink triggered!");
+        blink();
+    });
+    console.log("...Event Listeners added.");
+
+    // --- Animation Loop ---
+    const clock = new THREE.Clock();
+    const targetLookAt = new THREE.Vector3();
+    const eyeTarget = new THREE.Vector3();
+
+    console.log("...Starting GSAP animations setup.");
+    gsap.to(shaderMaterial.uniforms.u_pulse, {
+        value: 1.0, duration: 2, yoyo: true, repeat: -1, ease: "sine.inOut",
+        onUpdate: () => {
+            haloMesh.material.opacity = 0.2 + shaderMaterial.uniforms.u_pulse.value * 0.1;
+            haloMesh.scale.setScalar(1 + shaderMaterial.uniforms.u_pulse.value * 0.05);
+        }
+    });
+    gsap.to(shaderMaterial.uniforms.u_intensity, {
+        value: 0.2, duration: 3, yoyo: true, repeat: -1, ease: "sine.inOut" // Reduced from 0.5 to 0.2
+    });
+    console.log("...GSAP animations started.");
+
+    // --- Blinking Logic ---
+    // Test blink after 2 seconds
+    setTimeout(() => {
+        console.log("Test blink starting...");
+        blink();
+    }, 2000);
+    let lastBlinkTime = 0;
+    const blinkInterval = 3 + Math.random() * 2; // 3-5 seconds between blinks (in seconds)
+    let isBlinking = false;
+
+    const blink = () => {
+        if (isBlinking) return;
+        isBlinking = true;
+        console.log("Blinking! Pupils should shrink...");
+
+        // Get the actual pupil meshes from the eye groups
+        const leftPupil = eyeLeft.children[1]; // pupilLeft is the second child (index 1)
+        const rightPupil = eyeRight.children[1]; // pupilRight is the second child (index 1)
+        
+        console.log("Left pupil:", leftPupil);
+        console.log("Right pupil:", rightPupil);
+
+        // Blink - scale pupils down using Three.js scale method
+        gsap.to(leftPupil.scale, {
+            x: 0.1, y: 0.1, z: 0.1,
+            duration: 0.08, // Faster close
+            ease: "power2.in",
+        });
+        gsap.to(rightPupil.scale, {
+            x: 0.1, y: 0.1, z: 0.1,
+            duration: 0.08, // Faster close
+            ease: "power2.in",
+            onComplete: () => {
+                console.log("Pupils should be tiny now");
+                // Open - scale back to normal
+                gsap.to(leftPupil.scale, {
+                    x: 1, y: 1, z: 1,
+                    duration: 0.1, // Faster open
+                    ease: "power2.out",
+                });
+                gsap.to(rightPupil.scale, {
+                    x: 1, y: 1, z: 1,
+                    duration: 0.1, // Faster open
+                    ease: "power2.out",
+                    onComplete: () => {
+                        isBlinking = false;
+                        console.log("Blink complete - pupils should be back to normal size");
+                    }
+                });
+            }
+        });
+    };
+
+    const animate = () => {
+        try {
+            animationFrameId = window.requestAnimationFrame(animate);
+
+            const elapsedTime = clock.getElapsedTime();
+            shaderMaterial.uniforms.u_time.value = elapsedTime;
+
+            // Debug: Log every 5 seconds to make sure animation loop is running
+            if (Math.floor(elapsedTime) % 5 === 0 && Math.floor(elapsedTime) !== Math.floor(elapsedTime - 0.016)) {
+                console.log(`Animation running - elapsed time: ${elapsedTime.toFixed(1)}s`);
+            }
+
+            // Blinking logic
+            if (elapsedTime - lastBlinkTime > blinkInterval) {
+                console.log(`Time to blink! elapsed: ${elapsedTime}, lastBlink: ${lastBlinkTime}, interval: ${blinkInterval}`);
+                blink();
+                lastBlinkTime = elapsedTime;
+            }
+
+            target.x += (mouse.x - target.x) * 0.1;
+            target.y += (mouse.y - target.y) * 0.1;
+
+            gsap.to(sunBodyGroup.position, {
+                x: target.x * 0.5, y: target.y * 0.5,
+                duration: 2, ease: 'power2.out',
+            });
+
+            // Eye Following (using the eye GROUP now)
+            faceGroup.getWorldPosition(eyeTarget);
+            eyeTarget.add(new THREE.Vector3(mouse.x * 2.0, mouse.y * 2.0, 3.0));
+            // Check distance before lookAt
+            if (eyeLeft.getWorldPosition(new THREE.Vector3()).distanceToSquared(eyeTarget) > 0.001) {
+                 eyeLeft.lookAt(eyeTarget);
+            }
+             if (eyeRight.getWorldPosition(new THREE.Vector3()).distanceToSquared(eyeTarget) > 0.001) {
+                eyeRight.lookAt(eyeTarget);
+            }
+
+            // Eyebrows are now static and beautiful - no animations needed
+
+            const happyFactor = Math.max(0, mouse.y);
+            const smileScale = 0.9 + happyFactor * 0.15; // Reduced from 0.4 to 0.15
+            gsap.to(mouthMesh.scale, { y: smileScale, x: smileScale, duration: 0.5 });
+            gsap.to(mouthMesh.position, { y: -0.6 - happyFactor * 0.05, duration: 0.5 }); // Reduced from 0.1 to 0.05
+
+            flareGroup.rotation.z += 0.002;
+            flareGroup.children.forEach((flare) => {
+                const scale = 0.5 + Math.sin(elapsedTime * flare.userData.speed) * 0.3;
+                flare.scale.setScalar(scale);
+            });
+
+            // Update asteroids - simple orbital motion
+            asteroids.forEach(asteroid => {
+                // Update orbital position
+                asteroid.position.x = Math.cos(elapsedTime * asteroid.userData.orbitSpeed + asteroid.userData.orbitId) * (orbitRadius + Math.sin(asteroid.userData.orbitId) * 2);
+                asteroid.position.z = Math.sin(elapsedTime * asteroid.userData.orbitSpeed + asteroid.userData.orbitId) * (orbitRadius + Math.sin(asteroid.userData.orbitId) * 2);
+                
+                // Continue rotation
+                asteroid.rotateOnAxis(asteroid.userData.rotationAxis, asteroid.userData.rotationSpeed);
+            });
+
+            renderer.render(scene, camera);
+
+        } catch(error) {
+            showError(error, 'during animation loop');
+        }
+    };
+
+    // Start the animation
+    console.log("...Calling animate() for the first time.");
+    animate();
+
+}).catch(error => {
+    // --- This will catch any error during *importing* ---
+    showError(error, 'during module import');
+});
